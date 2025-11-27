@@ -1,0 +1,372 @@
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+    getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged 
+} from 'firebase/auth';
+import { 
+    getFirestore, doc, onSnapshot, setDoc, setLogLevel 
+} from 'firebase/firestore';
+import { Edit, Save, X, Trash2, CalendarCheck, MapPin, Loader2, PartyPopper } from 'lucide-react';
+
+// --- 全域變數和 Firebase 設定 (調整為標準 React 環境變數) ---
+
+// 注意：在 Vibe Coding 環境中，這些變數會被注入。在標準 React 專案中 (如 Vite)，
+// 您需要將您的 Firebase 配置 JSON 字串放入 .env 檔中，例如 VITE_FIREBASE_CONFIG。
+
+// 獲取 Firebase 配置。如果沒有配置，則設定為空物件，App 將無法儲存資料。
+const rawFirebaseConfig = import.meta.env.VITE_FIREBASE_CONFIG || '{}';
+const firebaseConfig = JSON.parse(rawFirebaseConfig);
+
+// 在標準 GitHub 部署中，通常不會有 __app_id 和 __initial_auth_token。
+// 我們使用預設值，並強制匿名登入，除非您有自訂的認證系統。
+const appId = import.meta.env.VITE_APP_ID || 'taipei-itinerary-gh'; 
+const initialAuthToken = null; // 在 GitHub 環境中忽略 Custom Token
+
+const ITINERARY_DOC_ID = 'taipei-jolin-2026-itinerary';
+
+// 設定 Firebase 服務
+let firebaseApp, db, auth;
+const isEnvReady = Object.keys(firebaseConfig).length > 0;
+if (isEnvReady) {
+    try {
+        firebaseApp = initializeApp(firebaseConfig);
+        db = getFirestore(firebaseApp);
+        auth = getAuth(firebaseApp);
+        setLogLevel('debug'); 
+    } catch (error) {
+        console.error("Firebase 初始化失敗:", error);
+    }
+} else {
+    console.warn("Firebase 配置資訊缺失，App 將無法儲存資料。請在 .env 檔中設定 VITE_FIREBASE_CONFIG。");
+}
+
+// --- 預設行程資料 (保持不變) ---
+const DEFAULT_ITINERARY = [
+    {
+        day: 1,
+        date: "2026/01/01 (四) - 演唱會日",
+        activities: [
+            { id: 1, time: "上午", title: "抵達台北 & Check-in", detail: "建議選擇信義區或松山區飯店，交通最便利。", isConcert: false },
+            { id: 2, time: "中午", title: "午餐：信義區百貨美食", detail: "在台北101或周邊百貨公司輕鬆享用午餐。", isConcert: false },
+            { id: 3, time: "14:00", title: "景點：臺北101觀景台 & 四四南村", detail: "在四四南村拍照打卡，感受懷舊文創氣息。", isConcert: false },
+            { id: 4, time: "17:30", title: "晚餐：國父紀念館周邊輕食", detail: "簡單用餐，搭捷運至國父紀念館站，準備進場。", isConcert: false },
+            { id: 5, time: "19:30", title: "⭐ 蔡依林《PLEASURE》演唱會 ⭐", detail: "臺北大巨蛋！記得帶票、應援物，提早抵達並確認交通。", isConcert: true },
+        ]
+    },
+    {
+        day: 2,
+        date: "2026/01/02 (五) - 文創悠閒日",
+        activities: [
+            { id: 6, time: "10:00", title: "景點：松山文創園區 (松菸)", detail: "享受悠閒早晨，逛逛設計展覽和特色商店。", isConcert: false },
+            { id: 7, time: "12:30", title: "午餐：松菸周邊特色咖啡廳", detail: "體驗東區巷弄美食或松菸內的簡餐。", isConcert: false },
+            { id: 8, time: "14:30", title: "景點：華山1914文創園區", detail: "搭捷運至忠孝新生站，繼續文青之旅，看場電影或逛獨立書店。", isConcert: false },
+            { id: 9, time: "17:00", title: "伴手禮：台北車站或西門町", detail: "最後衝刺，購買鳳梨酥等台灣特色伴手禮。", isConcert: false },
+            { id: 10, time: "傍晚", title: "賦歸", detail: "前往台北車站或機場。", isConcert: false },
+        ]
+    }
+];
+
+// --- Custom Hook 處理 Firebase 狀態與資料 (保持主要邏輯不變) ---
+const useItinerary = () => {
+    const [userId, setUserId] = useState(null);
+    const [isAuthReady, setIsAuthReady] = useState(false);
+    const [itinerary, setItinerary] = useState(DEFAULT_ITINERARY);
+    const [isLoading, setIsLoading] = useState(true);
+    const [isDbInitialized, setIsDbInitialized] = useState(isEnvReady); // 使用新的環境檢查
+
+    useEffect(() => {
+        if (!auth) {
+            setIsLoading(false);
+            return;
+        }
+
+        // 處理認證：由於我們在 GitHub 上，通常只使用匿名登入
+        const handleAuth = async () => {
+            try {
+                // 忽略 initialAuthToken，直接匿名登入
+                await signInAnonymously(auth);
+            } catch (error) {
+                console.error("Firebase 登入失敗:", error);
+                setUserId(auth.currentUser?.uid || 'anonymous-failed-auth');
+            }
+        };
+        handleAuth();
+
+        const unsubscribeAuth = onAuthStateChanged(auth, (user) => {
+            if (user) {
+                setUserId(user.uid);
+            } else {
+                setUserId(crypto.randomUUID());
+            }
+            setIsAuthReady(true);
+        });
+
+        return () => unsubscribeAuth();
+    }, []);
+
+    const itineraryDocPath = useMemo(() => {
+        if (!userId) return null;
+        // 使用私有資料路徑: /artifacts/{appId}/users/{userId}/itineraries/{ITINERARY_DOC_ID}
+        return `artifacts/${appId}/users/${userId}/itineraries/${ITINERARY_DOC_ID}`;
+    }, [userId]);
+
+    // 實時監聽資料庫
+    useEffect(() => {
+        if (!isAuthReady || !db || !itineraryDocPath) {
+            if (isAuthReady) setIsLoading(false);
+            return;
+        }
+
+        const docRef = doc(db, itineraryDocPath);
+        
+        const unsubscribeSnapshot = onSnapshot(docRef, (docSnap) => {
+            if (docSnap.exists() && docSnap.data().data) {
+                const loadedData = JSON.parse(docSnap.data().data);
+                setItinerary(loadedData);
+            } else {
+                saveItinerary(DEFAULT_ITINERARY);
+            }
+            setIsLoading(false);
+        }, (error) => {
+            console.error("Firestore 監聽失敗:", error);
+            setIsLoading(false);
+        });
+
+        return () => unsubscribeSnapshot();
+    }, [isAuthReady, db, itineraryDocPath]);
+
+
+    // 儲存行程到 Firestore
+    const saveItinerary = useCallback(async (newItinerary) => {
+        if (!db || !itineraryDocPath || !userId) {
+            console.error("資料庫未就緒，無法儲存。");
+            return false;
+        }
+
+        try {
+            await setDoc(doc(db, itineraryDocPath), {
+                userId: userId,
+                data: JSON.stringify(newItinerary),
+                updatedAt: new Date().toISOString(),
+            });
+            setItinerary(newItinerary);
+            return true;
+        } catch (e) {
+            console.error("儲存行程時出錯: ", e);
+            return false;
+        }
+    }, [db, itineraryDocPath, userId]);
+
+    // 處理活動更新
+    const updateActivity = useCallback(async (dayIndex, activityId, updates) => {
+        const newItinerary = itinerary.map((day, index) => {
+            if (index !== dayIndex) return day;
+
+            return {
+                ...day,
+                activities: day.activities.map(activity => 
+                    activity.id === activityId ? { ...activity, ...updates } : activity
+                )
+            };
+        });
+        
+        await saveItinerary(newItinerary);
+    }, [itinerary, saveItinerary]);
+
+    return { itinerary, updateActivity, isLoading, userId, isDbInitialized };
+};
+
+// --- Activity Card Component (略，與原版相同) ---
+// 為保持單一檔案原則，請在實際操作時將 ActivityCard 和 DayColumn 保持在 App.jsx 內。
+const ActivityCard = React.memo(({ dayIndex, activity, updateActivity }) => {
+    // 此處為 ActivityCard 的完整實現
+    const [isEditing, setIsEditing] = useState(false);
+    const [tempTitle, setTempTitle] = useState(activity.title);
+    const [tempDetail, setTempDetail] = useState(activity.detail);
+    const [tempTime, setTempTime] = useState(activity.time);
+
+    useEffect(() => {
+        setTempTitle(activity.title);
+        setTempDetail(activity.detail);
+        setTempTime(activity.time);
+    }, [activity]);
+
+    const handleSave = () => {
+        updateActivity(dayIndex, activity.id, {
+            title: tempTitle,
+            detail: tempDetail,
+            time: tempTime,
+        });
+        setIsEditing(false);
+    };
+    
+    // 定義樣式
+    const cardClasses = activity.isConcert
+        ? "bg-gradient-to-r from-red-500 to-pink-500 text-white shadow-pink-300 shadow-xl border-4 border-yellow-300"
+        : "bg-white text-gray-800 shadow-lg hover:shadow-xl transition duration-300";
+
+    const Icon = activity.isConcert ? PartyPopper : MapPin;
+    const iconColor = activity.isConcert ? "text-yellow-300" : "text-blue-500";
+    const titleColor = activity.isConcert ? "text-white" : "text-gray-800";
+
+    return (
+        <div className={`p-4 rounded-xl flex items-start space-x-4 ${cardClasses}`}>
+            <div className={`p-2 rounded-full ${activity.isConcert ? 'bg-red-700/50' : 'bg-blue-50'}`}>
+                <Icon className={`w-6 h-6 ${iconColor}`} />
+            </div>
+            
+            <div className="flex-1 min-w-0">
+                {isEditing ? (
+                    <div className="space-y-2">
+                        <input
+                            type="text"
+                            value={tempTime}
+                            onChange={(e) => setTempTime(e.target.value)}
+                            className="w-full text-sm p-1 border rounded-md font-mono text-black"
+                            placeholder="時間"
+                        />
+                        <input
+                            type="text"
+                            value={tempTitle}
+                            onChange={(e) => setTempTitle(e.target.value)}
+                            className="w-full text-lg font-bold p-1 border rounded-md text-black"
+                            placeholder="標題"
+                        />
+                        <textarea
+                            value={tempDetail}
+                            onChange={(e) => setTempDetail(e.target.value)}
+                            rows="2"
+                            className="w-full text-sm p-1 border rounded-md resize-none text-black"
+                            placeholder="詳細內容"
+                        />
+                    </div>
+                ) : (
+                    <>
+                        <p className={`text-sm font-mono mb-1 ${activity.isConcert ? 'text-white/80' : 'text-gray-500'}`}>{activity.time}</p>
+                        <h3 className={`text-lg font-bold ${titleColor}`}>{activity.title}</h3>
+                        <p className={`text-sm mt-1 ${activity.isConcert ? 'text-white/90' : 'text-gray-600'}`}>{activity.detail}</p>
+                    </>
+                )}
+            </div>
+
+            <div className="flex flex-col space-y-2">
+                {isEditing ? (
+                    <button 
+                        onClick={handleSave}
+                        className="p-2 rounded-full bg-green-500 text-white hover:bg-green-600 transition shadow-md"
+                        title="儲存"
+                    >
+                        <Save className="w-4 h-4" />
+                    </button>
+                ) : (
+                    <button 
+                        onClick={() => setIsEditing(true)}
+                        className={`p-2 rounded-full hover:bg-opacity-80 transition shadow-md ${activity.isConcert ? 'bg-yellow-400 text-red-700' : 'bg-blue-500 text-white'}`}
+                        title="編輯"
+                    >
+                        <Edit className="w-4 h-4" />
+                    </button>
+                )}
+                {isEditing && (
+                    <button 
+                        onClick={() => setIsEditing(false)}
+                        className="p-2 rounded-full bg-gray-400 text-white hover:bg-gray-500 transition shadow-md"
+                        title="取消"
+                    >
+                        <X className="w-4 h-4" />
+                    </button>
+                )}
+            </div>
+        </div>
+    );
+});
+
+
+// --- Day Column Component (略，與原版相同) ---
+const DayColumn = React.memo(({ dayData, updateActivity }) => {
+    // 此處為 DayColumn 的完整實現
+    return (
+        <div className="bg-gray-50 p-4 sm:p-6 rounded-2xl shadow-inner border border-gray-200">
+            <div className="flex items-center justify-center space-x-2 mb-6 border-b pb-3">
+                <CalendarCheck className="w-6 h-6 text-indigo-500" />
+                <h2 className="text-xl font-extrabold text-indigo-600">
+                    Day {dayData.day} - {dayData.date}
+                </h2>
+            </div>
+            
+            <div className="space-y-6">
+                {dayData.activities.map((activity) => (
+                    <ActivityCard 
+                        key={activity.id} 
+                        dayIndex={dayData.day - 1}
+                        activity={activity} 
+                        updateActivity={updateActivity} 
+                    />
+                ))}
+            </div>
+        </div>
+    );
+});
+
+
+// --- Main Application Component (略，與原版相同) ---
+const App = () => {
+    const { itinerary, updateActivity, isLoading, userId, isDbInitialized } = useItinerary();
+    
+    const renderContent = () => {
+        if (!isDbInitialized) {
+            return (
+                <div className="text-center p-12 bg-red-100 rounded-xl shadow-lg border-2 border-red-500">
+                    <h2 className="text-2xl font-bold text-red-700 mb-4">資料庫連接失敗</h2>
+                    <p className="text-red-600">無法獲取 Firebase 配置。行程將顯示預設內容，但無法儲存編輯。</p>
+                </div>
+            );
+        }
+
+        if (isLoading) {
+            return (
+                <div className="text-center p-12">
+                    <Loader2 className="animate-spin mx-auto h-10 w-10 text-blue-500" />
+                    <p className="mt-4 text-lg text-gray-600">正在載入您的專屬行程...</p>
+                </div>
+            );
+        }
+
+        return (
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                {itinerary.map((dayData) => (
+                    <DayColumn 
+                        key={dayData.day} 
+                        dayData={dayData} 
+                        updateActivity={updateActivity} 
+                    />
+                ))}
+            </div>
+        );
+    };
+
+    return (
+        <div className="min-h-screen bg-gray-100 p-4 sm:p-8 font-[Inter]">
+            <header className="text-center mb-10 bg-white p-6 rounded-xl shadow-2xl">
+                <h1 className="text-4xl font-black text-indigo-600 drop-shadow-lg flex items-center justify-center">
+                    <MapPin className="w-8 h-8 mr-3 text-pink-500" /> 
+                    臺北兩天一夜 & Jolin 演唱會行程
+                </h1>
+                <p className="text-lg text-gray-500 mt-2">
+                    2026/01/01 - 01/02 規劃器 | 點擊卡片旁的 <Edit className="w-4 h-4 inline-block align-text-bottom" /> 即可編輯
+                </p>
+                {userId && isDbInitialized && (
+                    <p className="text-xs text-gray-400 mt-3">
+                        使用者 ID (用於儲存): <span className="font-mono break-all">{userId}</span>
+                    </p>
+                )}
+            </header>
+
+            <main className="max-w-6xl mx-auto">
+                {renderContent()}
+            </main>
+        </div>
+    );
+};
+
+export default App;
